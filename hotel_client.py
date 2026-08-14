@@ -70,7 +70,7 @@ class MockHotelClient(HotelClient):
     # Simulate delays in async methods for realism
     async def _delay(self):
         # Random delay between 0.1 and 1 second to simulate network latency
-        await asyncio.sleep(random.uniform(0.1, 1.0))    
+        await asyncio.sleep(random.uniform(0.1, 1.0))
 
     async def get_hotel_info(self, hotel_id: str) -> HotelInfo | None:
         await self._delay()
@@ -87,9 +87,7 @@ class MockHotelClient(HotelClient):
             if query.lower() in hotel.hotel_info.name.lower()
         ]
 
-    async def book_hotel(
-        self, hotel_id: str, check_in: str, check_out: str
-    ) -> bool:
+    async def book_hotel(self, hotel_id: str, check_in: str, check_out: str) -> bool:
         await self._delay()
         for hotel in self.hotels:
             if hotel.hotel_info.name == hotel_id:
