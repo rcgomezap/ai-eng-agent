@@ -111,3 +111,11 @@ class MockHotelClient(HotelClient):
                     check_out_date=check_out,
                 )
         raise ValueError("Hotel not found")
+
+    async def list_hotels(self, check_in: str, check_out: str) -> list[HotelInfo]:
+        await self._delay()
+        return [
+            hotel.hotel_info
+            for hotel in self.hotels
+            if hotel.check_availability(check_in, check_out)
+        ]
