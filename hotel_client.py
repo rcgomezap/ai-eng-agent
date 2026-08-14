@@ -10,6 +10,7 @@ class Hotel:
         self.hotel_info = hotel_info
 
     def add_reservation(self, reservation: HotelReservation) -> bool:
+        # Randomly determine if the reservation can be made for simplicity
         if random.random() < 0.1:
             return False
         return True
