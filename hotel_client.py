@@ -1,27 +1,36 @@
 import asyncio
+from dataclasses import dataclass, field
+from datetime import date
 
-from interfaces import HotelClient
-import random
-from schemas import HotelAvailability, HotelInfo
+from interfaces import (
+    HotelClient,
+    HotelNotFoundError,
+    HotelUnavailableError,
+    InvalidStayDatesError,
+)
+from schemas import BookingResult, HotelAvailability, HotelInfo
 
 
+@dataclass(frozen=True, slots=True)
+class HotelReservation:
+    check_in: date
+    check_out: date
+
+
+@dataclass(slots=True)
 class Hotel:
-    def __init__(self, hotel_info: HotelInfo):
-        self.hotel_info = hotel_info
+    info: HotelInfo
+    reservations: list[HotelReservation] = field(default_factory=lambda: list[HotelReservation]())
 
-    def add_reservation(self, reservation: HotelReservation) -> bool:
-        # Randomly determine if the reservation can be made for simplicity
-        if random.random() < 0.1:
-            return False
-        return True
-
-    def check_availability(self, check_in: str, check_out: str) -> bool:
-        # Randomly determine availability for simplicity
-        return random.choice([True, False])
+    def is_available(self, check_in: date, check_out: date) -> bool:
+        return all(
+            check_out <= reservation.check_in or check_in >= reservation.check_out
+            for reservation in self.reservations
+        )
 
 
 def initialize_hotels() -> list[Hotel]:
-    hotels = [
+    return [
         Hotel(
             HotelInfo(
                 name="Grand Plaza",
@@ -53,67 +62,73 @@ def initialize_hotels() -> list[Hotel]:
             )
         ),
     ]
-    return hotels
-
-
-class HotelReservation:
-    def __init__(self, hotel: Hotel, check_in: str, check_out: str):
-        self.hotel = hotel
-        self.check_in = check_in
-        self.check_out = check_out
 
 
 class MockHotelClient(HotelClient):
-    def __init__(self):
-        self.hotels = initialize_hotels()
+    def __init__(self) -> None:
+        self._hotels = initialize_hotels()
+        self._booking_lock = asyncio.Lock()
 
-    # Simulate delays in async methods for realism
-    async def _delay(self):
-        # Random delay between 0.1 and 1 second to simulate network latency
-        await asyncio.sleep(random.uniform(0.1, 1.0))
+    @staticmethod
+    def _validate_dates(check_in: date, check_out: date) -> None:
+        if check_out <= check_in:
+            raise InvalidStayDatesError("Checkout must be after check-in.")
 
-    async def get_hotel_info(self, hotel_id: str) -> HotelInfo | None:
-        await self._delay()
-        for hotel in self.hotels:
-            if hotel.hotel_info.name == hotel_id:
-                return hotel.hotel_info
-        return None
+    def _find_hotel(self, hotel_id: str) -> Hotel:
+        normalized_id = hotel_id.casefold().strip()
+        for hotel in self._hotels:
+            if hotel.info.name.casefold() == normalized_id:
+                return hotel
+        raise HotelNotFoundError(f"Hotel '{hotel_id}' was not found.")
+
+    async def get_hotel_info(self, hotel_id: str) -> HotelInfo:
+        await asyncio.sleep(0)
+        return self._find_hotel(hotel_id).info
 
     async def search_hotels(self, query: str) -> list[HotelInfo]:
-        await self._delay()
+        await asyncio.sleep(0)
+        normalized_query = query.casefold().strip()
+        if not normalized_query:
+            return [hotel.info for hotel in self._hotels]
         return [
-            hotel.hotel_info
-            for hotel in self.hotels
-            if query.lower() in hotel.hotel_info.name.lower()
+            hotel.info
+            for hotel in self._hotels
+            if normalized_query
+            in (
+                f"{hotel.info.name} {hotel.info.address} {hotel.info.city} {hotel.info.country}"
+            ).casefold()
         ]
 
-    async def book_hotel(self, hotel_id: str, check_in: str, check_out: str) -> bool:
-        await self._delay()
-        for hotel in self.hotels:
-            if hotel.hotel_info.name == hotel_id:
-                reservation = HotelReservation(hotel, check_in, check_out)
-                return hotel.add_reservation(reservation)
-        raise ValueError("Hotel not found")
+    async def book_hotel(self, hotel_id: str, check_in: date, check_out: date) -> BookingResult:
+        self._validate_dates(check_in, check_out)
+        async with self._booking_lock:
+            hotel = self._find_hotel(hotel_id)
+            if not hotel.is_available(check_in, check_out):
+                raise HotelUnavailableError(
+                    f"Hotel '{hotel.info.name}' is unavailable for those dates."
+                )
+            hotel.reservations.append(HotelReservation(check_in, check_out))
+        return BookingResult(
+            hotel_id=hotel.info.name,
+            check_in_date=check_in,
+            check_out_date=check_out,
+            confirmed=True,
+        )
 
     async def check_availability(
-        self, hotel_id: str, check_in: str, check_out: str
+        self, hotel_id: str, check_in: date, check_out: date
     ) -> HotelAvailability:
-        await self._delay()
-        for hotel in self.hotels:
-            if hotel.hotel_info.name == hotel_id:
-                available = hotel.check_availability(check_in, check_out)
-                return HotelAvailability(
-                    hotel_id=hotel.hotel_info.name,
-                    available_rooms=1 if available else 0,
-                    check_in_date=check_in,
-                    check_out_date=check_out,
-                )
-        raise ValueError("Hotel not found")
+        self._validate_dates(check_in, check_out)
+        await asyncio.sleep(0)
+        hotel = self._find_hotel(hotel_id)
+        return HotelAvailability(
+            hotel_id=hotel.info.name,
+            available_rooms=int(hotel.is_available(check_in, check_out)),
+            check_in_date=check_in,
+            check_out_date=check_out,
+        )
 
-    async def list_hotels(self, check_in: str, check_out: str) -> list[HotelInfo]:
-        await self._delay()
-        return [
-            hotel.hotel_info
-            for hotel in self.hotels
-            if hotel.check_availability(check_in, check_out)
-        ]
+    async def list_hotels(self, check_in: date, check_out: date) -> list[HotelInfo]:
+        self._validate_dates(check_in, check_out)
+        await asyncio.sleep(0)
+        return [hotel.info for hotel in self._hotels if hotel.is_available(check_in, check_out)]

@@ -1,82 +1,230 @@
-import os
+# pyright: reportMissingTypeStubs=false, reportUnknownMemberType=false
 
-from langchain.messages import SystemMessage
-from langchain_openai import ChatOpenAI
-from langgraph.graph import MessagesState # type: ignore
-from langgraph.prebuilt import ToolNode
-from langchain.tools import tool
-from pydantic import BaseModel
+from collections.abc import Sequence
+from dataclasses import dataclass
+from datetime import date
+from typing import cast
 
-from interfaces import HotelClient
-from schemas import HotelAvailability, HotelInfo
+from injector import inject
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.tools import BaseTool, tool
+from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.errors import GraphRecursionError
+from langgraph.graph import END, START, MessagesState, StateGraph
+from langgraph.graph.state import CompiledStateGraph
+from langgraph.prebuilt import ToolNode, ToolRuntime, tools_condition
 
-system_prompt = """
-You are a helpful assistant that can provide information about hotels, search for hotels, check availability, and book hotels.
+from interfaces import HotelClient, HotelError
 
-If you are asked to perform an action that requires hotel information, you should use the provided tools to get the necessary data. Always ensure that you provide accurate and up-to-date information based on the user's request.
+SYSTEM_PROMPT = """
+You are an autonomous hotel assistant. Decide for yourself whether a tool is needed from
+the user's request. Never invent hotel data.
 
-If you are asked to book a hotel, you should confirm the booking with the user before proceeding. Always provide clear and concise responses, and if you cannot fulfill a request, explain why and suggest alternative actions if possible.
+When a tool reports an error, inspect it and either make one corrected tool call when the
+correction is unambiguous, or ask the user for the missing information. Do not repeat the
+same failing call indefinitely.
 
-If you are asked to check availability, you should provide the user with the available options and any relevant details.
+Before booking, obtain an explicit confirmation from the user for the hotel and exact
+dates. Only then call book_hotel with user_confirmed=true. Dates must use ISO format
+YYYY-MM-DD. For unrelated requests, explain that you can only assist with hotels.
+""".strip()
 
-If you are asked to search for hotels, you should provide a list of hotels that match the user's query, along with relevant details such as location, price, and amenities.
+MAX_CONTEXT_MESSAGES = 40
+DEFAULT_RECURSION_LIMIT = 10
 
-If you are asked to provide hotel information, you should provide the user with the requested details, including location, price, amenities, and any other relevant information.
 
-If you are asked to perform an action that is not related to hotels, you should politely decline and suggest that the user ask a different question or provide more information about their request.
+class AgentError(Exception):
+    """Base exception for failures exposed by the agent service."""
 
-If you are asked to perform an action that requires personal information, you should not ask for or store any personal data. Always prioritize user privacy and data security.
-"""
 
-class State(MessagesState):
-    active_reservations: list[HotelInfo]
+class AgentInputError(AgentError):
+    """Raised when an agent invocation has invalid input."""
 
-class AppContext(BaseModel):
+
+class ModelInvocationError(AgentError):
+    """Raised when the chat model cannot produce a response."""
+
+
+class AgentLoopLimitError(AgentError):
+    """Raised when the graph exceeds its configured reasoning limit."""
+
+
+class ToolOperationError(Exception):
+    """Expected error returned to the model so it can recover or ask a question."""
+
+
+@dataclass(frozen=True, slots=True)
+class AppContext:
     hotel_client: HotelClient
 
-@tool
-async def get_hotel_info(hotel_id: str, context: AppContext) -> HotelInfo | None:
-    """
-    Get hotel information by hotel ID.
-    """
-    return await context.hotel_client.get_hotel_info(hotel_id)
 
-@tool 
-async def search_hotels(query: str, context: AppContext) -> list[HotelInfo]:
-    """
-    Search for hotels based on a query string.
-    """
-    return await context.hotel_client.search_hotels(query)
+def _serialize_model(model: object) -> dict[str, object]:
+    model_dump = getattr(model, "model_dump", None)
+    if not callable(model_dump):
+        raise TypeError(f"Tool returned an unsupported value: {type(model).__name__}")
+    return cast(dict[str, object], model_dump(mode="json"))
+
 
 @tool
-async def book_hotel(hotel_id: str, check_in: str, check_out: str, context: AppContext) -> bool:
-    """
-    Book a hotel for the specified dates.
-    """
-    return await context.hotel_client.book_hotel(hotel_id, check_in, check_out)
+async def get_hotel_info(hotel_id: str, runtime: ToolRuntime[object, object]) -> dict[str, object]:
+    """Return verified details for one hotel.
 
-@tool
-async def check_availability(hotel_id: str, check_in: str, check_out: str, context: AppContext) -> HotelAvailability:
-    """
-    Check the availability of a hotel for the specified dates.
+    Use this tool when the user asks for the address, city, country, telephone, email, or
+    website of a specific hotel. ``hotel_id`` is currently the complete hotel name, for
+    example ``Grand Plaza``. If the name is uncertain, call ``search_hotels`` first rather
+    than guessing. A not-found error should lead to a corrected search or a clarification.
     """
     try:
+        context = cast(AppContext, runtime.context)
+        return _serialize_model(await context.hotel_client.get_hotel_info(hotel_id))
+    except HotelError as exc:
+        raise ToolOperationError(str(exc)) from exc
+
+
+@tool
+async def search_hotels(
+    query: str, runtime: ToolRuntime[object, object]
+) -> list[dict[str, object]]:
+    """Search the hotel catalog using a name, city, country, or address fragment.
+
+    Use this tool whenever the user describes a destination or only part of a hotel name.
+    Matching is case-insensitive. Pass an empty query only when the user explicitly asks to
+    list every hotel. An empty result means no catalog entry matched and should be reported
+    honestly or followed by a request for a broader query.
+    """
+    try:
+        context = cast(AppContext, runtime.context)
+        hotels = await context.hotel_client.search_hotels(query)
+        return [_serialize_model(hotel) for hotel in hotels]
+    except HotelError as exc:
+        raise ToolOperationError(str(exc)) from exc
+
+
+@tool
+async def check_availability(
+    hotel_id: str,
+    check_in: date,
+    check_out: date,
+    runtime: ToolRuntime[object, object],
+) -> dict[str, object]:
+    """Check room availability for a known hotel and exact stay dates.
+
+    Use this before offering or booking a stay. ``hotel_id`` must be the complete hotel
+    name. ``check_in`` and ``check_out`` must be ISO dates and checkout must be later than
+    check-in. If a date or hotel is missing, ask the user instead of inventing it. If this
+    tool returns an error, correct an obvious typo once or ask for clarification.
+    """
+    try:
+        context = cast(AppContext, runtime.context)
         availability = await context.hotel_client.check_availability(hotel_id, check_in, check_out)
-        return availability
-    except ValueError as e:
-        raise ValueError(f"Error checking availability: {str(e)}")
+        return _serialize_model(availability)
+    except HotelError as exc:
+        raise ToolOperationError(str(exc)) from exc
 
 
-tools = [get_hotel_info, search_hotels, book_hotel, check_availability]
+@tool
+async def book_hotel(
+    hotel_id: str,
+    check_in: date,
+    check_out: date,
+    user_confirmed: bool,
+    runtime: ToolRuntime[object, object],
+) -> dict[str, object]:
+    """Create a hotel reservation after explicit user confirmation.
 
-llm = ChatOpenAI(model="gpt-4o", temperature=0.7, base_url=os.environ.get("OPENAI_API_BASE_URL"))
+    Call this tool only after availability has been checked and the user has explicitly
+    confirmed the complete hotel name plus exact check-in and checkout dates. Set
+    ``user_confirmed`` to true only when that confirmation exists in the conversation.
+    Never retry this mutating operation automatically after an unexpected service or
+    network failure because doing so could create duplicate bookings.
+    """
+    if not user_confirmed:
+        raise ToolOperationError("Explicit user confirmation is required before booking.")
+    try:
+        context = cast(AppContext, runtime.context)
+        result = await context.hotel_client.book_hotel(hotel_id, check_in, check_out)
+        return _serialize_model(result)
+    except HotelError as exc:
+        raise ToolOperationError(str(exc)) from exc
 
-llm_with_tools = llm.bind_tools(tools) # pyright: ignore[reportUnknownMemberType]
 
-async def llm_call(state: State):
-    system_message = SystemMessage(content=system_prompt)
-    messages = [system_message] + state["messages"]
-    response = await llm_with_tools.ainvoke(messages)
-    return {"response": response.content} # pyright: ignore[reportUnknownVariableType]
+TOOLS: Sequence[BaseTool] = (
+    get_hotel_info,
+    search_hotels,
+    check_availability,
+    book_hotel,
+)
 
-async def 
+
+class HotelAgent:
+    def __init__(
+        self,
+        model: BaseChatModel,
+        hotel_client: HotelClient,
+        checkpointer: BaseCheckpointSaver[str],
+    ) -> None:
+        self._context = AppContext(hotel_client=hotel_client)
+        model_with_tools = model.bind_tools(TOOLS)
+
+        async def call_model(state: MessagesState) -> dict[str, list[BaseMessage]]:
+            history = list(state["messages"][-MAX_CONTEXT_MESSAGES:])
+            while history and not isinstance(history[0], HumanMessage):
+                history.pop(0)
+            try:
+                response = await model_with_tools.ainvoke(
+                    [SystemMessage(content=SYSTEM_PROMPT), *history]
+                )
+            except Exception as exc:
+                raise ModelInvocationError("The language model request failed.") from exc
+            return {"messages": [response]}
+
+        builder = StateGraph(MessagesState, context_schema=AppContext)
+        builder.add_node("agent", call_model)
+        builder.add_node(
+            "tools",
+            ToolNode(TOOLS, handle_tool_errors=(ToolOperationError,)),
+        )
+        builder.add_edge(START, "agent")
+        builder.add_conditional_edges("agent", tools_condition, {"tools": "tools", END: END})
+        builder.add_edge("tools", "agent")
+        self._graph: CompiledStateGraph[MessagesState, AppContext, MessagesState, MessagesState] = (
+            builder.compile(checkpointer=checkpointer)
+        )
+
+    async def invoke(self, prompt: str, thread_id: str) -> AIMessage:
+        clean_prompt = prompt.strip()
+        clean_thread_id = thread_id.strip()
+        if not clean_prompt:
+            raise AgentInputError("The prompt cannot be empty.")
+        if not clean_thread_id:
+            raise AgentInputError("The thread_id cannot be empty.")
+
+        try:
+            result = await self._graph.ainvoke(
+                {"messages": [HumanMessage(content=clean_prompt)]},
+                config={
+                    "configurable": {"thread_id": clean_thread_id},
+                    "recursion_limit": DEFAULT_RECURSION_LIMIT,
+                },
+                context=self._context,
+            )
+        except GraphRecursionError as exc:
+            raise AgentLoopLimitError(
+                f"The agent exceeded the {DEFAULT_RECURSION_LIMIT}-step reasoning limit."
+            ) from exc
+
+        for message in reversed(result["messages"]):
+            if isinstance(message, AIMessage):
+                return message
+        raise ModelInvocationError("The graph completed without an assistant response.")
+
+
+class AgentFactory:
+    @inject
+    def __init__(self, model: BaseChatModel, hotel_client: HotelClient) -> None:
+        self._model = model
+        self._hotel_client = hotel_client
+
+    def create(self, checkpointer: BaseCheckpointSaver[str]) -> HotelAgent:
+        return HotelAgent(self._model, self._hotel_client, checkpointer)
